@@ -36,10 +36,12 @@ fn dump_process_info(label: &str) {
 }
 
 pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
-    // Stage the daemon while the loader still has its original credentials
-    // and SELinux context. A late-loaded module can change both before the
-    // normal install path gets a chance to copy the executable.
-    utils::stage_daemon().context("Failed to stage ksud before late load")?;
+    // NOTE(galaxy parity): daemon staging is deferred until AFTER the module
+    // load (see below). In the exploit/jailbreak chain the loader runs under
+    // a vendor domain where writes to /data/adb are denied (EPERM); once the
+    // module is loaded, this process runs under KernelSU's policy and the
+    // daemon copy succeeds. The galaxy KernelSU fork ships the same split
+    // (load first, install self after).
     utils::daemonize(false)?;
     info!("late-load command triggered!");
     dump_process_info("late-load start");
@@ -83,6 +85,10 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
         warn!("clear temp configs failed: {e}");
     }
 
+    // Install the daemon into /data/adb now that the module is loaded and
+    // this process runs under KernelSU's policy (galaxy parity; pre-load
+    // staging is denied under the chain's vendor domain).
+    utils::stage_daemon().context("Failed to stage ksud after module load")?;
     utils::finish_install(None).context("Failed to finish ksud installation")?;
 
     // 5. Handle module updates
