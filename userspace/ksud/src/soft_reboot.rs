@@ -200,8 +200,14 @@ pub fn soft_reboot() -> Result<()> {
     }
     terminate_waitsys(&mut waitsys);
 
+    // The framework is already down: a failure here must not skip `start`.
+    // Left half-stopped, the device is turned into a real reboot by the
+    // watchdog (or the user), and on a late-load device that loses root.
     info!("post-fs-data");
-    on_post_data_fs()?;
+    let post_fs = on_post_data_fs();
+    if let Err(ref e) = post_fs {
+        warn!("post-fs-data failed: {e:#} (continuing to start)");
+    }
     info!("start");
     let status = Command::new("start").status().context("start failed")?;
     if !status.success() {
@@ -213,6 +219,10 @@ pub fn soft_reboot() -> Result<()> {
         warn!("wait for boot completed failed: {e}");
     }
     on_boot_completed();
+
+    // The reboot cycle itself is done; surface a post-fs-data failure now
+    // instead of having skipped the recovery.
+    post_fs?;
 
     unsafe {
         _exit(0);
