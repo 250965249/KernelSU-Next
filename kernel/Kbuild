@@ -124,6 +124,12 @@ $(info -- KernelSU-Next Git repo detected at: $(GIT_ROOT))
 endif
 endif
 
+# PATCH(ghostsam): version pin — official v3.4.0 code/name/tag (samsung-lateload lineage counts 3271 => 33271).
+# Unconditional: overrides git-derived values above (and works even when git detection is unavailable).
+KSU_GIT_VERSION := 3294
+KSU_GIT_TAG := v3.4.0
+KSU_GIT_VERSION_VALID := 1
+
 # Calculate version if git version is available
 ifdef KSU_GIT_VERSION_VALID
 # ksu_version: major * 30000 + git version for historical reasons
