@@ -140,6 +140,17 @@ fn reset_boot_completed() -> Result<()> {
     Ok(())
 }
 
+fn set_rescue_party_boot_reason() -> Result<()> {
+    // ksu's emulated reboots occasionally get escalated by rescue party into a
+    // hard reboot; announcing a warm reboot is what keeps it from escalating.
+    sys_prop::init().context("Failed to initialize system property API")?;
+    let rp = resetprop();
+    rp.set("sys.boot.reason", "reboot,rescueparty_warm_reboot")
+        .context("Failed to set sys.boot.reason")?;
+    info!("set sys.boot.reason to reboot,rescueparty_warm_reboot");
+    Ok(())
+}
+
 fn wait_for_boot_completed() -> Result<()> {
     sys_prop::init().context("Failed to initialize system property API")?;
     let rp = resetprop();
@@ -207,6 +218,10 @@ pub fn soft_reboot() -> Result<()> {
     let post_fs = on_post_data_fs();
     if let Err(ref e) = post_fs {
         warn!("post-fs-data failed: {e:#} (continuing to start)");
+    }
+    // Best-effort: a failure to set the prop must not stop `start`.
+    if let Err(e) = set_rescue_party_boot_reason() {
+        warn!("failed to set rescue party boot reason: {e:#}");
     }
     info!("start");
     let status = Command::new("start").status().context("start failed")?;
