@@ -35,7 +35,7 @@ fn dump_process_info(label: &str) {
     );
 }
 
-pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool, soft_reboot: bool) -> Result<()> {
     // NOTE(galaxy parity): daemon staging is deferred until AFTER the module
     // load (see below). In the exploit/jailbreak chain the loader runs under
     // a vendor domain where writes to /data/adb are denied (EPERM); once the
@@ -133,6 +133,14 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
 
     // 11. Execute post-mount stage scripts (blocking)
     init_event::run_stage("post-mount", true);
+
+    if soft_reboot {
+        // soft_reboot runs stop → post-fs-data → start → service →
+        // boot-completed internally, so skip the inline service/boot-completed
+        // stages to avoid double execution.
+        info!("Triggering soft-reboot...");
+        return crate::soft_reboot::soft_reboot();
+    }
 
     // 12. Execute service stage scripts (non-blocking)
     init_event::run_stage("service", false);

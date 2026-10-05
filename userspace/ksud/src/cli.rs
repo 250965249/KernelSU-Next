@@ -55,6 +55,15 @@ enum Commands {
         /// manager package name
         #[arg(long, default_value_t = String::from("com.rifsxd.ksunext"))]
         package_name: String,
+
+        /// Trigger soft-reboot after late-load completes instead of running
+        /// service/boot-completed inline
+        #[arg(long)]
+        soft_reboot: bool,
+
+        /// Set kernel/bootloader partitions read-only after late-load completes
+        #[arg(long)]
+        ro_partitions: bool,
     },
 
     /// Load a kernel module with kallsyms access
@@ -681,7 +690,16 @@ pub fn run() -> Result<()> {
             package_name,
             kmi,
             allow_shell,
-        } => crate::late_load::run(&package_name, kmi, allow_shell),
+            soft_reboot,
+            ro_partitions,
+        } => {
+            let result = crate::late_load::run(&package_name, kmi, allow_shell, soft_reboot);
+            if ro_partitions {
+                let count = utils::set_partitions_ro();
+                info!("set {count} partition(s) read-only");
+            }
+            result
+        }
         Commands::Services => {
             if ksucalls::get_version() <= 0 {
                 info!("KernelSU Next not available, exiting services");
