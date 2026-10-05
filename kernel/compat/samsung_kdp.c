@@ -55,6 +55,9 @@ static inc_rlimit_ucounts_t inc_rlimit_ucounts_fn;
 static dec_rlimit_ucounts_t dec_rlimit_ucounts_fn;
 #endif
 
+/* false = kernel without the KDP creds suite: plain cred paths are used */
+static bool kdp_ready;
+
 static void __nocfi samsung_kdp_commit_worker(struct work_struct *work)
 {
 	struct samsung_kdp_commit_work *commit_work =
@@ -122,6 +125,11 @@ void __nocfi ksu_samsung_kdp_put_cred(const struct cred *cred)
 #ifdef CONFIG_KSU_SAMSUNG_KDP
 	struct cred *mutable_cred = (struct cred *)cred;
 
+	if (!kdp_ready) {
+		put_cred(cred);
+		return;
+	}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	if (mutable_cred && kdp_usecount_sub_and_test_fn(1, mutable_cred))
 #else
@@ -143,24 +151,24 @@ int ksu_samsung_kdp_init(void)
 		(kdp_assign_pgd_t)ksu_resolve_symbol_for_functable_hook(
 			"kdp_assign_pgd");
 	if (!prepare_ro_creds_fn || !kdp_assign_pgd_fn) {
-		pr_err("Samsung KDP credential functions unavailable\n");
-		return -ENOENT;
+		pr_warn("Samsung KDP credential functions unavailable - plain credential handling\n");
+		return 0;
 	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	kdp_usecount_sub_and_test_fn = (kdp_usecount_sub_and_test_t)
 		ksu_resolve_symbol_for_functable_hook(
 			"kdp_usecount_sub_and_test");
 	if (!kdp_usecount_sub_and_test_fn) {
-		pr_err("Samsung KDP credential functions unavailable\n");
-		return -ENOENT;
+		pr_warn("Samsung KDP credential functions unavailable - plain credential handling\n");
+		return 0;
 	}
 #else
 	kdp_usecount_dec_and_test_fn = (kdp_usecount_dec_and_test_t)
 		ksu_resolve_symbol_for_functable_hook(
 			"kdp_usecount_dec_and_test");
 	if (!kdp_usecount_dec_and_test_fn) {
-		pr_err("Samsung KDP credential functions unavailable\n");
-		return -ENOENT;
+		pr_warn("Samsung KDP credential functions unavailable - plain credential handling\n");
+		return 0;
 	}
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
@@ -171,10 +179,11 @@ int ksu_samsung_kdp_init(void)
 		(dec_rlimit_ucounts_t)ksu_resolve_symbol_for_functable_hook(
 			"dec_rlimit_ucounts");
 	if (!inc_rlimit_ucounts_fn || !dec_rlimit_ucounts_fn) {
-		pr_err("Samsung KDP ucounts functions unavailable\n");
-		return -ENOENT;
+		pr_warn("Samsung KDP ucounts functions unavailable - plain credential handling\n");
+		return 0;
 	}
 #endif
+	kdp_ready = true;
 	pr_info("Samsung KDP credential compatibility enabled\n");
 #endif
 	return 0;
@@ -192,6 +201,8 @@ int ksu_samsung_kdp_commit_creds(struct cred *cred)
 
 	if (!cred)
 		return -EINVAL;
+	if (!kdp_ready)
+		return commit_creds(cred);
 	INIT_WORK(&commit_work.work, samsung_kdp_commit_worker);
 	init_completion(&commit_work.completion);
 	commit_work.target = current;
