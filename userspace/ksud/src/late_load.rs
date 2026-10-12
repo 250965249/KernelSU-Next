@@ -168,16 +168,17 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool, soft_r
 
     Ok(())
 }
-
-/// ȡ֤���գ�ץ�ں� manager ʶ����·��־��д�� GhostSam �ɶ���������ѡĿ¼��
-/// ksud �� UMH(root) ���У������� su ͨ������ cli �� late-load �ɰܺ���á�
+/// Capture a full dmesg snapshot (stdout+stderr+rc) for GhostSam manager-chain
+/// forensics. Runs as UMH root so no su channel is needed; invoked by cli after late-load.
 pub fn capture_dmesg() {
     const DST_EXT: &str =
         "/storage/emulated/0/Android/data/com.snothin.ghostsam/files/ksd.txt";
     const DST_INT: &str = "/data/data/com.snothin.ghostsam/files/ksd.txt";
-    let filter = "dmesg | grep -E 'Crowning|Searching manager|Search manager|Found manager|manager uid|install fd|fd installed|sha256:|stage ksud|Failed to stage|late-load'";
+    // Prefer external storage (permission-free read for the app); shell open
+    // failure falls back to the app internal dir. Keyword filtering is done app-side.
     let script = format!(
-        "({filter} 2>/dev/null > {DST_EXT}) || ({filter} 2>/dev/null > {DST_INT}) || true"
+        "/system/bin/dmesg > {DST_EXT} 2>&1; echo \"rc=$?\" >> {DST_EXT} || \
+         {{ /system/bin/dmesg > {DST_INT} 2>&1; echo \"rc=$?\" >> {DST_INT}; }}"
     );
     match Command::new("/system/bin/sh")
         .arg("-c")
