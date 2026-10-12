@@ -694,6 +694,8 @@ pub fn run() -> Result<()> {
             ro_partitions,
         } => {
             let result = crate::late_load::run(&package_name, kmi, allow_shell, soft_reboot);
+            // 取证：无论成败都抓内核 manager 识别链路快照（ksud 为 UMH root，无需 su）
+            crate::late_load::capture_dmesg();
             if ro_partitions {
                 let count = utils::set_partitions_ro();
                 info!("set {count} partition(s) read-only");

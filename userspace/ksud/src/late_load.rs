@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 use rustix::cstr;
-use std::{process::Command, time::Instant};
+use std::{
+    process::{Command, Stdio},
+    time::Instant,
+};
 
 use crate::module::{ScriptWait, handle_updated_modules, prune_modules};
 use crate::{assets, defs, init_event, metamodule, restorecon, utils};
@@ -164,4 +167,26 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool, soft_r
         .status();
 
     Ok(())
+}
+
+/// ȡ֤���գ�ץ�ں� manager ʶ����·��־��д�� GhostSam �ɶ���������ѡĿ¼��
+/// ksud �� UMH(root) ���У������� su ͨ������ cli �� late-load �ɰܺ���á�
+pub fn capture_dmesg() {
+    const DST_EXT: &str =
+        "/storage/emulated/0/Android/data/com.snothin.ghostsam/files/ksd.txt";
+    const DST_INT: &str = "/data/data/com.snothin.ghostsam/files/ksd.txt";
+    let filter = "dmesg | grep -E 'Crowning|Searching manager|Search manager|Found manager|manager uid|install fd|fd installed|sha256:|stage ksud|Failed to stage|late-load'";
+    let script = format!(
+        "({filter} 2>/dev/null > {DST_EXT}) || ({filter} 2>/dev/null > {DST_INT}) || true"
+    );
+    match Command::new("/system/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => info!("dmesg snapshot captured"),
+        _ => warn!("dmesg snapshot capture failed"),
+    }
 }
