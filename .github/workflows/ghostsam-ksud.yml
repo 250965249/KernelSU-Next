@@ -1,0 +1,15 @@
+name: GhostSam ksud (aarch64 android)
+on:
+  workflow_dispatch:
+
+jobs:
+  build-lkm:
+    uses: ./.github/workflows/build-lkm.yml
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+  build-ksud:
+    needs: [build-lkm, build-ksuinit]
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: aarch64-linux-android
+      os: ubuntu-latest
