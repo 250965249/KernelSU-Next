@@ -228,14 +228,17 @@ fun HomeScreen(navigator: DestinationsNavigator) {
             val requiresNewKernel = isManager && kernelUAPIVersion != null && managerUAPIVersion > kernelUAPIVersion
             val requiresNewManager = isManager && kernelUAPIVersion != null && managerUAPIVersion < kernelUAPIVersion
 
+            // Jailbreak mode runs on locked bootloaders, so flashing a boot image would brick the device.
+            val canInstallKernelUpdate = lkmMode == true && !Natives.isLateLoadMode
+
             if (requiresNewKernel) {
                 WarningCard(
                     stringResource(
-                        id = if (lkmMode == true) R.string.require_kernel_version else R.string.require_kernel_version_gki,
+                        id = if (canInstallKernelUpdate) R.string.require_kernel_version else R.string.require_kernel_version_gki,
                         kernelUAPIVersion!!,
                         managerUAPIVersion
                     ),
-                    onClick = if (lkmMode == true) {
+                    onClick = if (canInstallKernelUpdate) {
                         { navigator.navigate(InstallScreenDestination) }
                     } else null
                 )
@@ -1010,6 +1013,7 @@ private data class HomeInfoSnapshot(
     val unameRelease: String = "",
     val unameMachine: String = "",
     val seccompStatus: String = "Unavailable",
+    val selinuxStatusRes: Int = R.string.selinux_status_unknown,
 )
 
 private fun buildHomeInfoSnapshot(
@@ -1055,6 +1059,7 @@ private fun buildHomeInfoSnapshot(
         unameRelease = uname?.release.orEmpty(),
         unameMachine = uname?.machine.orEmpty(),
         seccompStatus = seccompStatus,
+        selinuxStatusRes = getSELinuxStatus(),
     )
 }
 
@@ -1206,7 +1211,7 @@ private fun InfoCard(autoExpand: Boolean = false) {
                         Spacer(Modifier.height(16.dp))
                         InfoCardItem(
                             label = stringResource(R.string.home_selinux_status),
-                            content = getSELinuxStatus(),
+                            content = stringResource(homeInfo.selinuxStatusRes),
                             icon = Icons.Filled.Security,
                         )
 
