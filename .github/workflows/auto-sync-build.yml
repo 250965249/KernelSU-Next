@@ -1,0 +1,371 @@
+name: Auto Sync & Build KernelSU-Next Samsung ksud
+
+# Scheduled sync from the official KernelSU-Next `dev` into our `samsung`
+# branch, then build all-KMI LKM + aarch64 ksud and publish `latest-ksud`.
+#
+# The released `ksud-next-aarch64` (plus its `ksud-next-aarch64.version`
+# sidecar) is consumed by GhostSam's auto-build workflow. Three things here are
+# load-bearing for that consumer:
+#
+#   1. The merge result is pushed *and* the build jobs check out the branch tip,
+#      not `github.sha` (which is frozen at run-creation time, i.e. before the
+#      merge). Without that, every run published the previous run's tree.
+#   2. Fork release tags (`latest-ksud`) are dropped before any `git describe`,
+#      otherwise ksud stamps VERSION_NAME from the release tag instead of a real
+#      version tag.
+#   3. A merge conflict no longer silently ships stale code: the run goes red
+#      after publishing, with the conflicting paths in the annotation.
+#
+# NOTE ON THE SCHEDULE: GitHub runs a `schedule` trigger on the repository's
+# DEFAULT branch, and every job below checks out `${{ github.ref_name }}`. The
+# `Assert branch` step therefore requires `github.ref_name == samsung`; for the
+# daily 02:00 run to work the repo default branch must be `samsung`. A
+# `workflow_dispatch --ref samsung` is unaffected by the default branch.
+on:
+  schedule:
+    - cron: "0 18 * * *"   # 02:00 Asia/Shanghai
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: next-auto-sync-build
+  cancel-in-progress: false
+
+env:
+  BRANCH: samsung
+  # Files the samsung delta owns. A conflict confined to these is
+  # auto-resolved in our favour; anything else fails loudly.
+  SAMSUNG_OWNED: "kernel/core/init.c kernel/Kbuild kernel/Kconfig kernel/hook/arm64/patch_memory.c kernel/hook/arm64/syscall_hook.c kernel/hook/x86_64/syscall_hook.c kernel/hook/syscall_hook.h kernel/hook/syscall_hook_manager.c kernel/hook/tp_marker.c kernel/feature/selinux_hide.c kernel/policy/app_profile.c userspace/ksud/src/cli.rs userspace/ksud/src/late_load.rs userspace/ksud/src/module.rs userspace/ksud/src/restorecon.rs userspace/ksud/src/soft_reboot.rs userspace/ksud/src/utils.rs"
+  # Conflicts under these prefixes are resolved in our
+  # favour too: they are not part of the ksud payload.
+  PAYLOAD_IRRELEVANT_PREFIXES: "manager/ .github/workflows/ website/ js/ docs/"
+  VARIANT: next
+  UPSTREAM_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+  UPSTREAM_REF: dev
+  # From userspace/ksud/build.rs: VERSION_CODE = 30000 + `git rev-list --count HEAD`
+  # Fallback only - the release job greps build.rs for the live formula.
+  VERSION_CODE_OFFSET: "30000"
+  # Empty = the stamp is derived from git. Set "<code>:<name>" only
+  # for a variant whose userspace/ksud/build.rs pins the stamp.
+  EXPECTED_STAMP: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
+      behind: ${{ steps.merge.outputs.behind }}
+      conflict: ${{ steps.merge.outputs.conflict }}
+      auto_resolved: ${{ steps.merge.outputs.auto_resolved }}
+      upstream_commit: ${{ steps.merge.outputs.upstream_commit }}
+      upstream_commit_full: ${{ steps.merge.outputs.upstream_commit_full }}
+      upstream_version_name: ${{ steps.merge.outputs.upstream_version_name }}
+    steps:
+      - name: Assert branch
+        run: |
+          # Scheduled runs use the repository default branch; every job below
+          # checks out `${{ github.ref_name }}`, so anything else would build a
+          # tree different from the one that was just merged.
+          if [ "${{ github.ref_name }}" != "$BRANCH" ]; then
+            echo "::error::expected to run on '$BRANCH', got '${{ github.ref_name }}'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: samsung
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream KernelSU-Next dev
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_REF" --tags --force
+          # captured so the merge result can be reduced back to our own
+          # .github/workflows (see the restore below)
+          ours_before=$(git rev-parse HEAD)
+
+          upstream_commit=$(git rev-parse --short=8 "upstream/$UPSTREAM_REF")
+          upstream_commit_full=$(git rev-parse "upstream/$UPSTREAM_REF")
+          upstream_version_name=$(git describe --tags --always "upstream/$UPSTREAM_REF" | sed 's/^v//')
+          behind_before=$(git rev-list --count "HEAD..upstream/$UPSTREAM_REF")
+          echo "::notice::upstream/$UPSTREAM_REF = $upstream_version_name ($upstream_commit), $behind_before commit(s) ahead of us"
+
+          conflict=false
+          auto_resolved=""
+          if [ "$behind_before" -eq 0 ]; then
+            echo "::notice::already up to date with upstream/$UPSTREAM_REF"
+          elif git merge --no-edit --no-ff "upstream/$UPSTREAM_REF"; then
+            echo "::notice::merged $behind_before upstream commit(s)"
+          else
+            conflicted=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            # SAMSUNG_OWNED files are ours to define: retry keeping our side of
+            # the conflicting hunks. The LKM/ksud build right after is the safety
+            # net - if upstream moved a signature we depend on it will not compile
+            # and the run fails before a payload is published.
+            unowned=""
+            ignored=""
+            for f in $conflicted; do
+              case " $SAMSUNG_OWNED " in
+                *" $f "*) ignored="$ignored $f"; continue ;;
+              esac
+              # manager/ is not part of the ksud payload, so a conflict there
+              # must not block the payload: keep this branch's manager.
+              payload_irrelevant=false
+              for p in ${PAYLOAD_IRRELEVANT_PREFIXES:-}; do
+                case "$f" in
+                  "$p"*) payload_irrelevant=true ;;
+                esac
+              done
+              if [ "$payload_irrelevant" = true ]; then
+                ignored="$ignored $f"
+              else
+                unowned="$unowned $f"
+              fi
+            done
+            if [ -n "$ignored" ]; then
+              echo "::notice::conflicts outside the payload (resolved in our favour):$ignored"
+            fi
+            if [ -n "$conflicted" ] && [ -z "$unowned" ]; then
+              if git merge --no-edit --no-ff -X ours "upstream/$UPSTREAM_REF"; then
+                auto_resolved=$(echo $conflicted | paste -sd' ' -)
+                echo "::warning::auto-resolved samsung-owned conflicts by keeping our side of: $auto_resolved"
+              elif [ -z "$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)" ]; then
+                # `-X ours` cannot resolve modify/delete, and upstream keeps
+                # deleting or renaming workflow files. They are never part of the
+                # payload and are restored from the pre-merge snapshot anyway, so
+                # keep ours and finish the merge by hand.
+                rm -rf .github/workflows
+                git checkout "$ours_before" -- .github/workflows
+                git add -A
+                git commit --no-edit -q
+                auto_resolved=$(echo $conflicted | paste -sd' ' -)
+                echo "::warning::kept our .github/workflows to finish the merge: $auto_resolved"
+              else
+                git merge --abort >/dev/null 2>&1 || true
+                conflict=true
+                echo "::error::auto-resolve failed in: $(echo $conflicted | paste -sd' ' -) - resolve by hand"
+              fi
+            else
+              conflict=true
+              echo "::error::upstream merge conflicts in:${unowned:- $conflicted} - these are NOT samsung-owned files, resolve by hand; this run publishes a payload $behind_before commit(s) behind $upstream_version_name"
+            fi
+          fi
+
+          # GITHUB_TOKEN is an installation token and may not create or update
+          # files under .github/workflows ("refusing to allow a GitHub App ...
+          # without workflows permission"), which rejected the whole push. This
+          # fork's CI is ours anyway, so pin that directory to the pre-merge
+          # snapshot and fold the restore into the merge commit.
+          if ! git diff --quiet "$ours_before" HEAD -- .github/workflows; then
+            rm -rf .github/workflows
+            git checkout "$ours_before" -- .github/workflows
+            git add -A
+            git commit -q --amend --no-edit
+            echo "::notice::kept our .github/workflows - a token push may not modify workflow files"
+          fi
+
+          # Keep the fork's tags in sync so `git describe` inside the build jobs
+          # (which clone from origin) can see upstream version tags.
+          git push origin "HEAD:$BRANCH"
+          git push origin --tags || echo "::warning::could not push tags"
+
+          behind_after=$(git rev-list --count "HEAD..upstream/$UPSTREAM_REF" 2>/dev/null || echo "$behind_before")
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "behind=$behind_after"
+            echo "conflict=$conflict"
+            echo "auto_resolved=$auto_resolved"
+            echo "upstream_commit=$upstream_commit"
+            echo "upstream_commit_full=$upstream_commit_full"
+            echo "upstream_version_name=$upstream_version_name"
+          } >> "$GITHUB_OUTPUT"
+
+  build-lkm:
+    needs: sync
+    uses: ./.github/workflows/build-lkm.yml
+
+  build-ksuinit:
+    needs: sync
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-ksud:
+    needs: [build-lkm, build-ksuinit]
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: aarch64-linux-android
+      pack_lkm: true
+      pack_ksuinit: true
+
+  release:
+    needs: [sync, build-ksud]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download ksud artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ksud-aarch64-linux-android
+          path: ksud-artifact
+
+      - name: Publish latest-ksud release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::release step failed at line $LINENO"' ERR
+          ksud="$(find ksud-artifact -type f -name ksud -print -quit)"
+          if [ -z "$ksud" ]; then
+            echo "::error::no ksud binary in the downloaded artifact"
+            find ksud-artifact -maxdepth 3 -type f -exec ls -l {} \; || true
+            exit 1
+          fi
+          bin="ksud-${VARIANT}-aarch64"
+          cp "$ksud" "$bin"
+          chmod +x "$bin"
+
+          # `gh release create latest-ksud` puts a `latest-ksud` tag on HEAD, and
+          # `git describe --tags` prefers any tag over walking back to a version
+          # tag. Drop every non-version tag locally so the stamp matches upstream.
+          git tag -l | grep -Ev '^v[0-9]' | xargs -r git tag -d >/dev/null || true
+
+          # The checkout only carries tags that exist on the fork (`latest-ksud`),
+          # so describe fell back to a bare sha. Bring the upstream version tags
+          # in locally (never pushed) to name the build after its upstream base.
+          git fetch --tags --force "$UPSTREAM_REPO" 'refs/tags/v*:refs/tags/v*' >/dev/null 2>&1 || true
+          git_version_name=$(git describe --tags --always | sed 's/^v//')
+          # Follow build.rs instead of hardcoding the offset: upstream has changed
+          # the formula twice already (40000-2815 -> 30000-4001 -> 30000+996).
+          offset_expr=$(grep -oE 'let version_code = [0-9][^;]*\+ version_code' \
+            userspace/ksud/build.rs | head -n1 \
+            | sed -E 's/^let version_code = //; s/ \+ version_code$//' || true)
+          if [ -z "$offset_expr" ]; then
+            offset_expr="$VERSION_CODE_OFFSET"
+          fi
+          echo "version-code offset from build.rs: $offset_expr"
+          commit_count=$(git rev-list --count HEAD)
+          version_code=$(( offset_expr + commit_count ))
+          version_name="$git_version_name"
+          version_pinned=false
+          if [ -n "${EXPECTED_STAMP:-}" ]; then
+            # This variant's build.rs pins the stamp, so git cannot name it.
+            # The git identity is still recorded in the sidecar below.
+            version_code=${EXPECTED_STAMP%%:*}
+            version_name=${EXPECTED_STAMP#*:}
+            version_pinned=true
+          fi
+
+          # The binary is the authority: it must agree with the tree we publish.
+          embedded_code=$(grep -aoE 'KSU_NO_NEW_PRIVS[0-9]{5}' "$bin" | head -n1 | sed 's/KSU_NO_NEW_PRIVS//' || true)
+          embedded_name=$(grep -aoE 'KSU_NO_NEW_PRIVS[0-9]{5}[0-9A-Za-z._:+~-]+' "$bin" | head -n1 | sed -E 's/^KSU_NO_NEW_PRIVS[0-9]{5}//' || true)
+          # The name literal is only usually pooled next to the code; when it is
+          # not, record the git value rather than an empty field.
+          if [ -z "$embedded_name" ]; then
+            embedded_name="$version_name"
+          fi
+          echo "tree implies   code=$version_code name=$version_name (git=$git_version_name pinned=$version_pinned)"
+          echo "binary stamps  code=$embedded_code name=$embedded_name"
+
+          # The code is OFFSET + `git rev-list --count HEAD`, a solid fingerprint
+          # of the tree the binary came from - enforce it strictly. The name
+          # literal is only *usually* laid out right next to it, so enforce the
+          # name only when the binary actually exposes one.
+          if [ "$embedded_code" != "$version_code" ]; then
+            echo "::error::built ksud stamps code=$embedded_code but this tree implies $version_code - the build did not use the synced tree (or the pin in userspace/ksud/build.rs changed; update EXPECTED_STAMP)"
+            exit 1
+          fi
+          if [ -z "$embedded_name" ]; then
+            echo "::notice::binary carries no readable VERSION_NAME next to its code; using the git value ($version_name)"
+          elif [ "$embedded_name" != "$version_name" ]; then
+            echo "::error::built ksud stamps name=$embedded_name but this tree implies $version_name"
+            exit 1
+          fi
+          case "$embedded_name" in
+            latest-*|manager-ci*)
+              echo "::error::ksud VERSION_NAME is still '$embedded_name' - a fork release tag leaked into git describe"
+              exit 1
+              ;;
+          esac
+
+          # --- samsung-ci receipt fields (consumed by GhostSam) -----------------
+          # kernel_version_code: same convention as kernel/Kbuild, which computes
+          #   KSU_VERSION = 30000 + `git rev-list --count HEAD`.
+          kernel_version_code=$(( 30000 + commit_count ))
+          # kernel_uapi_version: current KERNEL_SU_UAPI_VERSION from the uapi header.
+          kernel_uapi_version=$(sed -nE 's/.*KERNEL_SU_UAPI_VERSION[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' uapi/supercall.h)
+          if [ -z "$kernel_uapi_version" ]; then
+            echo "::error::could not read KERNEL_SU_UAPI_VERSION from uapi/supercall.h"
+            exit 1
+          fi
+          # official_ci_commit: the full 40-hex official dev HEAD that this merge
+          # brought in (the short 8-hex `upstream_commit` above is kept for
+          # backward compatibility; GhostSam's pairing wants full 40 hex).
+          official_ci_commit="${{ needs.sync.outputs.upstream_commit_full }}"
+          # producer artifact id + digest from this very run's artifact list.
+          run_id="${{ github.run_id }}"
+          artifacts_json=$(gh api "repos/250965249/KernelSU-Next/actions/runs/${run_id}/artifacts?per_page=100")
+          producer_artifact_id=$(printf '%s' "$artifacts_json" | jq -r '[.artifacts[] | select(.name=="ksud-aarch64-linux-android")][0].id')
+          producer_artifact_digest=$(printf '%s' "$artifacts_json" | jq -r '[.artifacts[] | select(.name=="ksud-aarch64-linux-android")][0].digest')
+          if [ -z "$producer_artifact_id" ] || [ "$producer_artifact_id" = "null" ]; then
+            echo "::warning::could not resolve the ksud-aarch64-linux-android artifact id from run ${run_id}"
+            producer_artifact_id=""
+          fi
+          if [ -z "$producer_artifact_digest" ] || [ "$producer_artifact_digest" = "null" ]; then
+            producer_artifact_digest=""
+          fi
+
+          cat > "${bin}.version" <<EOF
+          variant=$VARIANT
+          version_code=$embedded_code
+          version_name=$embedded_name
+          commit=$(git rev-parse HEAD)
+          commit_short=$(git rev-parse --short=8 HEAD)
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          version_pinned=$version_pinned
+          merge_auto_resolved=${{ needs.sync.outputs.auto_resolved }}
+          git_version_name=$git_version_name
+          behind_upstream=${{ needs.sync.outputs.behind }}
+          upstream_commit=${{ needs.sync.outputs.upstream_commit }}
+          upstream_version_name=${{ needs.sync.outputs.upstream_version_name }}
+          sha256=$(sha256sum "$bin" | cut -d' ' -f1)
+          build_kind=samsung-ci
+          kernel_version_code=$kernel_version_code
+          kernel_uapi_version=$kernel_uapi_version
+          official_ci_commit=$official_ci_commit
+          producer_run_id=${{ github.run_id }}
+          producer_artifact_id=$producer_artifact_id
+          producer_artifact_digest=$producer_artifact_digest
+          EOF
+          echo "--- ${bin}.version ---"
+          cat "${bin}.version"
+
+          if ! gh release view latest-ksud >/dev/null 2>&1; then
+            gh release create latest-ksud --title "KernelSU-Next Samsung ksud (latest)" \
+              --notes "Automated Samsung all-KMI build from the samsung branch, synced to official KernelSU-Next dev."
+          fi
+          # `--clobber` races on an existing asset name (HTTP 422
+          # "ReleaseAsset.name already exists"). Delete first, then upload.
+          for a in "$bin" "${bin}.version"; do
+            gh release delete-asset latest-ksud "$a" --yes >/dev/null 2>&1 || true
+          done
+          gh release upload latest-ksud "$bin" "${bin}.version"
+          echo "::notice::published $bin ($embedded_name)"
+
+      # Publish first, then go red - silently withholding the asset hides the
+      # breakage from the GhostSam build, which is how the payload froze.
+      - name: Fail when the payload is behind upstream
+        if: ${{ needs.sync.outputs.behind != '0' || needs.sync.outputs.conflict == 'true' }}
+        run: |
+          echo "::error::published a ksud that is ${{ needs.sync.outputs.behind }} commit(s) behind ${{ needs.sync.outputs.upstream_version_name }} (merge_conflict=${{ needs.sync.outputs.conflict }}). Resolve the conflict on the samsung branch."
+          exit 1

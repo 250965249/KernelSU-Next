@@ -39,6 +39,8 @@ jobs:
     steps:
     - name: Checkout source code
       uses: actions/checkout@v7
+      with:
+        ref: ${{ github.ref_name }}
 
     - name: Build kernelsu.ko
       env:
@@ -63,7 +65,7 @@ jobs:
           EXTRA_ARGS="$EXTRA_ARGS KSU_NEXT_MANAGER_HASH=$EXPECTED_MANAGER_HASH"
         fi
 
-        CONFIG_KSU=m CC=clang make $EXTRA_ARGS
+        CONFIG_KSU=m CONFIG_KSU_SAMSUNG_KDP=y CONFIG_KSU_SAMSUNG_RKP=y CONFIG_KSU_SAMSUNG_DEFEX=y CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y CC=clang make $EXTRA_ARGS
         
         echo "=== Build completed ==="
 
