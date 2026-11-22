@@ -21,6 +21,14 @@ on:
         required: false
         type: boolean
         default: true
+      # Optional: upstream repo whose version tags (v*) must be visible to
+      # `git describe` at build time, so the VERSION_NAME this binary embeds
+      # matches the one the producer's release job computes. Empty (default)
+      # keeps the historical behaviour for the manager builds.
+      upstream_repo:
+        required: false
+        type: string
+        default: ''
 jobs:
   build:
     runs-on: ${{ inputs.os }}
@@ -88,6 +96,18 @@ jobs:
         # VERSION_NAME into `latest-ksud-6-g4f74a450`. Keeping only real version
         # tags makes the stamp match upstream CI's naming.
         git tag -l | grep -Ev '^v[0-9]' | xargs -r git tag -d >/dev/null || true
+
+    - name: Fetch upstream version tags for version stamping
+      if: ${{ inputs.upstream_repo != '' }}
+      run: |
+        # A GITHUB_TOKEN push of a tag whose commit touches .github/workflows is
+        # rejected without `workflows` permission, so the fork cannot carry
+        # upstream version tags and a plain origin clone would only see stale ones
+        # (e.g. v3.4.1 while the tree already sits on v3.4.2). Fetch the upstream
+        # v* tags directly here so the VERSION_NAME build.rs embeds via
+        # `git describe` matches the release job, which fetches the same set
+        # before stamping the sidecar.
+        git fetch --tags --force "${{ inputs.upstream_repo }}" 'refs/tags/v*:refs/tags/v*'
 
     - name: Build ksud
       env:

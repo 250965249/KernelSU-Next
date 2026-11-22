@@ -172,10 +172,13 @@ jobs:
             echo "::notice::kept our .github/workflows - a token push may not modify workflow files"
           fi
 
-          # Keep the fork's tags in sync so `git describe` inside the build jobs
-          # (which clone from origin) can see upstream version tags.
+          # Push only the merge result. We deliberately do NOT push tags: a
+          # GITHUB_TOKEN push of a tag whose commit touches .github/workflows is
+          # rejected without `workflows` permission, so it failed every run and
+          # left the fork without upstream version tags. The build and release
+          # jobs instead fetch upstream v* tags directly before `git describe`,
+          # which keeps the binary's VERSION_NAME and the sidecar's in lockstep.
           git push origin "HEAD:$BRANCH"
-          git push origin --tags || echo "::warning::could not push tags"
 
           behind_after=$(git rev-list --count "HEAD..upstream/$UPSTREAM_REF" 2>/dev/null || echo "$behind_before")
           {
@@ -203,6 +206,10 @@ jobs:
       target: aarch64-linux-android
       pack_lkm: true
       pack_ksuinit: true
+      # Must match env.UPSTREAM_REPO above; the `env` context is not available in
+      # a reusable-workflow `with:`, so it is spelled out here. The fetch makes
+      # the binary's git-describe VERSION_NAME match the release job's.
+      upstream_repo: https://github.com/KernelSU-Next/KernelSU-Next.git
 
   release:
     needs: [sync, build-ksud]
