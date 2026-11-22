@@ -35,7 +35,13 @@ fn dump_process_info(label: &str) {
     );
 }
 
-pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool, soft_reboot: bool) -> Result<()> {
+    // NOTE(galaxy parity): daemon staging is deferred until AFTER the module
+    // load (see below). In the exploit/jailbreak chain the loader runs under
+    // a vendor domain where writes to /data/adb are denied (EPERM); once the
+    // module is loaded, this process runs under KernelSU's policy and the
+    // daemon copy succeeds. The galaxy KernelSU fork ships the same split
+    // (load first, install self after).
     utils::daemonize(false)?;
     info!("late-load command triggered!");
     dump_process_info("late-load start");
@@ -50,7 +56,6 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
             Ok,
         )?;
         info!("Detected KMI: {kmi}");
-
 
         // 3. Get kernelsu.ko from embedded assets
         let ko_name = format!("{kmi}_kernelsu.ko");
@@ -80,7 +85,11 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
         warn!("clear temp configs failed: {e}");
     }
 
-    utils::install(None).context("Failed to install ksud")?;
+    // Install the daemon into /data/adb now that the module is loaded and
+    // this process runs under KernelSU's policy (galaxy parity; pre-load
+    // staging is denied under the chain's vendor domain).
+    utils::stage_daemon().context("Failed to stage ksud after module load")?;
+    utils::finish_install(None).context("Failed to finish ksud installation")?;
 
     crate::hot_install::clean_trash();
 
@@ -129,6 +138,14 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
     // 11. Execute post-mount stage scripts using the same deadline
     init_event::run_stage("post-mount", wait);
 
+    if soft_reboot {
+        // soft_reboot runs stop → post-fs-data → start → service →
+        // boot-completed internally, so skip the inline service/boot-completed
+        // stages to avoid double execution.
+        info!("Triggering soft-reboot...");
+        return crate::soft_reboot::soft_reboot();
+    }
+
     // 12. Execute service stage scripts (non-blocking)
     init_event::run_stage("service", ScriptWait::NoWait);
 
@@ -137,7 +154,9 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
 
     // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
     info!("Restarting KernelSU Next Manager {package_name}...");
-    let _ = Command::new("am").args(["force-stop", package_name]).status();
+    let _ = Command::new("am")
+        .args(["force-stop", package_name])
+        .status();
     let _ = Command::new("am")
         .args([
             "start",

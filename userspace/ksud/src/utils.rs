@@ -229,13 +229,53 @@ fn link_ksud_to_bin() -> Result<()> {
     Ok(())
 }
 
-pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
+pub fn stage_daemon() -> Result<()> {
     ensure_dir_exists(defs::ADB_DIR)?;
-    let _ = std::fs::remove_file(defs::DAEMON_PATH);
-    std::fs::copy(
-        std::env::current_exe().with_context(|| "Failed to get self exe path")?,
-        defs::DAEMON_PATH,
-    )?;
+    let daemon = PathBuf::from(defs::DAEMON_PATH);
+    // Resolve only for the "already installed?" check below; the copy itself
+    // must NOT use the resolved path — see the comment there.
+    if std::env::current_exe().is_ok_and(|p| p == daemon) {
+        return Ok(());
+    }
+
+    let staged = PathBuf::from(format!("{}.stage", defs::DAEMON_PATH));
+    let _ = std::fs::remove_file(&staged);
+    // Read own image via /proc/self/exe, DO NOT resolve the real path: in the
+    // jailbreak/exploit chain the image is bind-mounted over a disguised path
+    // (e.g. /system/bin/logcat) and opening that resolved path is denied
+    // (EPERM) on Samsung (DEFEX/KDP). Mirrors galaxy KernelSU's
+    // utils::install().
+    let data = std::fs::read("/proc/self/exe").context("stage: read /proc/self/exe")?;
+    // Write by hand instead of fs::copy: the kernel-side copy primitives
+    // (copy_file_range) can fail with EPERM on this platform, and a plain
+    // write loop lets us verify the result with a readback below.
+    {
+        let mut f = std::fs::File::create(&staged).context("stage: create daemon.stage")?;
+        std::io::Write::write_all(&mut f, &data).context("stage: write daemon.stage")?;
+        let _ = f.sync_all();
+    }
+    let written = std::fs::metadata(&staged)
+        .context("stage: stat daemon.stage")?
+        .len();
+    if written != data.len() as u64 {
+        anyhow::bail!("stage: short write {} != {}", written, data.len());
+    }
+    log::info!("stage: wrote {} bytes to {}", written, staged.display());
+    #[cfg(unix)]
+    set_permissions(&staged, Permissions::from_mode(0o755)).context("stage: chmod daemon.stage")?;
+    let _ = std::fs::remove_file(&daemon);
+    std::fs::rename(&staged, &daemon).with_context(|| {
+        format!(
+            "Failed to install staged daemon {} as {}",
+            staged.display(),
+            daemon.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+pub fn finish_install(libadbroot: Option<PathBuf>) -> Result<()> {
     restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
     // install binary assets
     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
@@ -249,6 +289,11 @@ pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
+    stage_daemon()?;
+    finish_install(libadbroot)
 }
 
 pub fn uninstall(package_name: &str) -> Result<()> {
@@ -375,4 +420,51 @@ pub fn detach_process_group(use_init_pgrp: bool) {
     if let Err(e2) = setpgid(None, None) {
         log::error!("failed to set process group: {e2:?}");
     }
+}
+
+pub fn set_partitions_ro() -> i32 {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::io::AsRawFd;
+
+    const PARTITIONS: &[&str] = &[
+        "boot",
+        "dtbo",
+        "init_boot",
+        "vendor_boot",
+        "super",
+        "optics",
+        "prism",
+        "vbmeta",
+    ];
+    const BLKROSET: libc::c_int = 0x125d;
+
+    let mut count = 0i32;
+
+    for base in PARTITIONS {
+        for suffix in ["", "_a", "_b"] {
+            let path = format!("/dev/block/by-name/{base}{suffix}");
+
+            let std::result::Result::Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+
+            match file.metadata() {
+                std::result::Result::Ok(m) if m.file_type().is_block_device() => {}
+                _ => continue,
+            }
+
+            let on: libc::c_int = 1;
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKROSET, &on) };
+            if ret == 0 {
+                count += 1;
+            } else {
+                log::warn!(
+                    "set_partitions_ro: BLKROSET failed for {path}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    count
 }

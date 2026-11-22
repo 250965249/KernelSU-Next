@@ -1,5 +1,9 @@
 kernelsu-objs := core/init.o
 
+kernelsu-objs += compat/samsung_kdp.o
+kernelsu-objs += compat/samsung_defex.o
+kernelsu-objs += compat/samsung_rkp.o
+
 kernelsu-objs += feature/kernel_umount.o
 kernelsu-objs += feature/module_blacklist.o
 kernelsu-objs += feature/sulog.o
@@ -72,6 +76,18 @@ endif
 ifeq ($(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER),y)
 ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=1
 endif
+ifeq ($(CONFIG_KSU_SAMSUNG_KDP),y)
+ccflags-y += -DCONFIG_KSU_SAMSUNG_KDP=1
+endif
+ifeq ($(CONFIG_KSU_SAMSUNG_RKP),y)
+ccflags-y += -DCONFIG_KSU_SAMSUNG_RKP=1
+endif
+ifeq ($(CONFIG_KSU_SAMSUNG_DEFEX),y)
+ccflags-y += -DCONFIG_KSU_SAMSUNG_DEFEX=1
+endif
+ifeq ($(CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT),y)
+ccflags-y += -DCONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=1
+endif
 endif
 
 ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
@@ -90,7 +106,7 @@ else
 KSU_KERNEL_DIR := $(src)
 endif
 
-ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
+ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include -I$(KSU_KERNEL_DIR)/..
 
 # preinit runner: a static nolibc binary embedded into kernelsu, see preinit/.
 # It is built against the installed UAPI headers of the target kernel
@@ -155,6 +171,12 @@ KSU_GIT_VERSION_VALID := 1
 $(info -- KernelSU-Next Git repo detected at: $(GIT_ROOT))
 endif
 endif
+
+# PATCH(ghostsam): version pin — official v3.4.2 (tag v3.4.2 == upstream tip 4c706b59; count 3355 => 33355).
+# Unconditional: overrides git-derived values above (and works even when git detection is unavailable).
+KSU_GIT_VERSION := 3355
+KSU_GIT_TAG := v3.4.2
+KSU_GIT_VERSION_VALID := 1
 
 # Calculate version if git version is available
 ifdef KSU_GIT_VERSION_VALID
